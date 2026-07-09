@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -10,15 +11,127 @@
 
 #define BUFSIZE 1024
 #define MAX_CLIENT  64
+#define MAX_NICK_LEN 20
 
-int clnt_socks[MAX_CLIENT];
-int clnt_id = 0;
+/* Phase 1의 clnt_socks[] 단순 int 배열은 접속자 식별 정보(닉네임, 접속시각)를
+   담을 수 없어 구조체 배열로 교체한다. 여러 클라이언트 쓰레드 + accept 쓰레드가
+   동시에 읽고 쓰므로 clients_lock으로 감싼다. */
+typedef struct {
+    int fd;
+    char nickname[MAX_NICK_LEN + 1];
+    time_t join_time;
+} Client;
+
+Client clients[MAX_CLIENT];
+int clnt_cnt = 0;
+pthread_mutex_t clients_lock = PTHREAD_MUTEX_INITIALIZER;
 
 void error_handling(const char *message)
 {
-        fputs(message, stderr);
-        fputc('\n', stderr);
-        exit(-1);
+    fputs(message, stderr);
+    fputc('\n', stderr);
+    exit(-1);
+}
+
+/* clients_lock을 이미 보유한 상태에서만 호출할 것. */
+int find_index_by_fd(int fd)
+{
+    for (int i = 0; i < clnt_cnt; i++) {
+        if (clients[i].fd == fd) return i;
+    }
+    return -1;
+}
+
+/* TCP는 바이트 스트림이라 write() 두 번이 상대의 read() 한 번에 합쳐질 수 있다.
+   그래서 모든 메시지 끝에 '\n'을 붙여 전송하고, 받는 쪽은 '\n' 단위로 잘라
+   읽는다(아래 handle_clnt 참고). 이 함수들이 그 프레이밍을 전담한다. */
+void send_to(int fd, const char* msg)
+{
+    write(fd, msg, strlen(msg));
+    write(fd, "\n", 1);
+}
+
+/* exclude_fd 를 제외한 전원에게 전송. exclude_fd에 -1을 주면 전원 포함. */
+void broadcast(const char* msg, int exclude_fd)
+{
+    pthread_mutex_lock(&clients_lock);
+    for (int i = 0; i < clnt_cnt; i++) {
+        if (clients[i].fd != exclude_fd) {
+            write(clients[i].fd, msg, strlen(msg));
+            write(clients[i].fd, "\n", 1);
+        }
+    }
+    pthread_mutex_unlock(&clients_lock);
+}
+
+/* WHISPER(Phase 3)의 대상|메시지 구분자와 충돌하지 않도록 '|'와 공백을 금지한다. */
+int is_valid_nickname(const char* name)
+{
+    size_t len = strlen(name);
+    if (len == 0 || len > MAX_NICK_LEN) return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (name[i] == '|' || name[i] == ' ') return 0;
+    }
+    return 1;
+}
+
+void handle_name_change(int clnt_sock, const char* new_name)
+{
+    if (!is_valid_nickname(new_name)) {
+        send_to(clnt_sock, "[ERR]닉네임은 1~20자, 공백/'|' 문자 사용 불가입니다.");
+        return;
+    }
+
+    char old_name[MAX_NICK_LEN + 1];
+    int is_first;
+    char sys_msg[BUFSIZE];
+
+    pthread_mutex_lock(&clients_lock);
+    int idx = find_index_by_fd(clnt_sock);
+    if (idx == -1) {
+        pthread_mutex_unlock(&clients_lock);
+        return;
+    }
+    is_first = (clients[idx].nickname[0] == '\0');
+    strcpy(old_name, clients[idx].nickname);
+    strncpy(clients[idx].nickname, new_name, MAX_NICK_LEN);
+    clients[idx].nickname[MAX_NICK_LEN] = '\0';
+    pthread_mutex_unlock(&clients_lock);
+
+    if (is_first) {
+        snprintf(sys_msg, sizeof(sys_msg), "[SYS]%s님이 입장하셨습니다.", new_name);
+    } else {
+        snprintf(sys_msg, sizeof(sys_msg), "[SYS]%s님이 %s(으)로 별명을 변경하셨습니다.", old_name, new_name);
+    }
+    /* 본인 화면에도 입장/변경 확인이 떠야 하므로 전원(-1) 대상 브로드캐스트. */
+    broadcast(sys_msg, -1);
+}
+
+void handle_chat(int clnt_sock, const char* text)
+{
+    char nickname[MAX_NICK_LEN + 1] = "익명";
+    char out[BUFSIZE];
+
+    pthread_mutex_lock(&clients_lock);
+    int idx = find_index_by_fd(clnt_sock);
+    if (idx != -1 && clients[idx].nickname[0] != '\0') {
+        strcpy(nickname, clients[idx].nickname);
+    }
+    pthread_mutex_unlock(&clients_lock);
+
+    snprintf(out, sizeof(out), "%s: %s", nickname, text);
+    broadcast(out, clnt_sock);
+}
+
+void process_message(int clnt_sock, char* msg)
+{
+    if (0 == strncmp(msg, "[REQ:NAME]", 10)) {
+        handle_name_change(clnt_sock, msg + 10);
+    } else if (0 == strncmp(msg, "[CHAT]", 6)) {
+        handle_chat(clnt_sock, msg + 6);
+    } else {
+        send_to(clnt_sock, "[ERR]알 수 없는 명령입니다.");
+    }
 }
 
 void* handle_clnt(void* arg)
@@ -27,37 +140,61 @@ void* handle_clnt(void* arg)
     free(arg);
 
     int str_len = 0;
-    char msg[BUFSIZE] = {0,};
-    int idx = 0;
+    char chunk[BUFSIZE];
+    /* 여러 read() 호출에 걸쳐 미완성 메시지를 이어 붙이는 누적 버퍼.
+       한 줄('\n' 기준)이 완성될 때만 process_message로 넘긴다. */
+    char linebuf[BUFSIZE * 4];
+    int linelen = 0;
 
-    /* read() 함수 반환값에 따른 동작 
+    /* read() 함수 반환값에 따른 동작
     반환값이 양수 : 클라이언트가 보낸 메시지가 존재한다는 의미이므로, while 안쪽 동작
     반환값이 0 : 클라이언트가 연결을 종료했다는 의미이므로, while 나감
     반환값이 음수 : 에러 발생을 의미하므로, while 나감
     */
-    while(0 < (str_len=read(clnt_sock, msg, sizeof(msg)))){
-        int idy = 0;
-        
-        while(idy < clnt_id){
-            if(clnt_sock != clnt_socks[idy]){ 
-                write(clnt_socks[idy], msg, str_len);
+    while (0 < (str_len = read(clnt_sock, chunk, sizeof(chunk)))) {
+        if (linelen + str_len >= (int)sizeof(linebuf)) {
+            /* 개행 없이 버퍼가 꽉 참 - 비정상 입력으로 보고 버린다 (오버플로 방지) */
+            linelen = 0;
+            continue;
+        }
+        memcpy(linebuf + linelen, chunk, str_len);
+        linelen += str_len;
+
+        int start = 0;
+        for (int i = 0; i < linelen; i++) {
+            if (linebuf[i] == '\n') {
+                linebuf[i] = '\0';
+                if (i > start && linebuf[i - 1] == '\r') linebuf[i - 1] = '\0';
+                process_message(clnt_sock, linebuf + start);
+                start = i + 1;
             }
-            idy++;
+        }
+        if (start > 0) {
+            memmove(linebuf, linebuf + start, linelen - start);
+            linelen -= start;
         }
     }
 
-    for (idx=0; idx<clnt_id; idx++)
-    {
-        if (clnt_sock==clnt_socks[idx])
-        {
-            while(idx < clnt_id - 1){
-                clnt_socks[idx] = clnt_socks[idx + 1];
-                idx++;
-            }
-            break;
+    /* 접속 종료: 목록에서 제거 후 남은 유저에게 퇴장을 알린다.
+       닉네임은 제거 전에 복사해둬야 브로드캐스트 메시지에 쓸 수 있다. */
+    char left_name[MAX_NICK_LEN + 1] = {0,};
+    pthread_mutex_lock(&clients_lock);
+    int idx = find_index_by_fd(clnt_sock);
+    if (idx != -1) {
+        strcpy(left_name, clients[idx].nickname);
+        while (idx < clnt_cnt - 1) {
+            clients[idx] = clients[idx + 1];
+            idx++;
         }
+        clnt_cnt--;
     }
-    clnt_id--;
+    pthread_mutex_unlock(&clients_lock);
+
+    if (left_name[0] != '\0') {
+        char sys_msg[BUFSIZE];
+        snprintf(sys_msg, sizeof(sys_msg), "[SYS]%s님이 퇴장하셨습니다.", left_name);
+        broadcast(sys_msg, -1);
+    }
 
     close(clnt_sock);
     return NULL;
@@ -111,7 +248,20 @@ int main(int argc, char* argv[])
             error_handling("accept() error");
         }
 
-        clnt_socks[clnt_id++] = clnt_sock;
+        pthread_mutex_lock(&clients_lock);
+        if (clnt_cnt >= MAX_CLIENT) {
+            /* 정원 초과 - 원본 코드엔 없던 배열 오버플로 방지 체크. 구조체 크기가
+               커진 만큼 넘치면 메모리를 침범하므로 반드시 막아야 한다. */
+            pthread_mutex_unlock(&clients_lock);
+            send_to(clnt_sock, "[ERR]서버 접속 정원이 가득 찼습니다.");
+            close(clnt_sock);
+            continue;
+        }
+        clients[clnt_cnt].fd = clnt_sock;
+        clients[clnt_cnt].nickname[0] = '\0';
+        clients[clnt_cnt].join_time = time(NULL);
+        clnt_cnt++;
+        pthread_mutex_unlock(&clients_lock);
 
         int* sock = (int*)malloc(sizeof(int));
         if(NULL == sock){
