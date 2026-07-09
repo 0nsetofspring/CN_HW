@@ -67,11 +67,11 @@ $ ./client 127.0.0.1 8080 User1
 
 *(💡 Tip: 채팅창에 `(하트)`, `(따봉)`을 입력하면 자동으로 ❤️, 👍 이모티콘으로 변환되어 전송됩니다.)*
 <br><br>
-
+<br>
 ## ⚙️ 시스템 아키텍처 및 통신 프로토콜 (For Grader)
 
 패킷(메시지)의 앞단에 태그(Tag)를 부착하여 클라이언트와 서버가 서로의 의도를 명확히 파싱(Parsing)하도록 설계되었습니다.
-<br>
+<br><br>
 
 ### 통신 프로토콜 명세 (Protocol Specification)
 
@@ -79,14 +79,17 @@ $ ./client 127.0.0.1 8080 User1
 | --- | --- | --- | --- |
 | `C ➡️ S` | `[CHAT]` | `[CHAT]안녕하세요` | 서버가 비속어 필터링 후 전체 브로드캐스팅 |
 | `C ➡️ S` | `[REQ:NAME]` | `[REQ:NAME]새닉네임` | 해당 소켓의 닉네임 상태 업데이트 및 알림 방송 |
-| `C ➡️ S` | `[REQ:WHISPER]` | `[REQ:WHISPER]대상|할말` | 대상 닉네임의 소켓 FD를 탐색하여 1:1 유니캐스트 (최초 `|` 1개만 분리 파싱) |
-| `C ➡️ S` | `[REQ:BOT]` | `[REQ:BOT]dice` / `[REQ:BOT]poll A|B` / `[REQ:BOT]vote A` / `[REQ:BOT]poll_end` | 서버 내부 봇 로직 실행 후 결과 브로드캐스팅 |
+| `C ➡️ S` | `[REQ:WHISPER]` | `[REQ:WHISPER]대상\|할말` | 대상 닉네임의 소켓 FD를 탐색하여 1:1 유니캐스트 (최초 `|` 1개만 분리 파싱) |
+| `C ➡️ S` | `[REQ:BOT]` | `[REQ:BOT]dice` / `[REQ:BOT]poll A\|B` / `[REQ:BOT]vote A` / `[REQ:BOT]poll_end` | 서버 내부 봇 로직 실행 후 결과 브로드캐스팅 |
 | `C ➡️ S` | `[REQ:LIST]` | `[REQ:LIST]` | 접속자 배열을 순회하여 리스트 반환 |
 | `C ➡️ S` | `[REQ:SEARCH]` | `[REQ:SEARCH]과제` | 대화 기록 버퍼 탐색 후 결과 반환 |
 | `S ➡️ C` | `[SYS]` | `[SYS]OOO님 입장` | 클라이언트 단에서 파란색 시스템 테마로 렌더링 |
 | `S ➡️ C` | `[ERR]` | `[ERR]잘못된 명령어` | 클라이언트 단에서 붉은색 에러 테마로 렌더링 |
-| `S ➡️ C` | `[RES:LIST]` | `[RES:LIST]user1,120|user2,45` | `/list` 응답. 닉네임,접속유지초 를 `|`로 join |
+| `S ➡️ C` | `[RES:LIST]` | `[RES:LIST]user1,120\|user2,45` | `/list` 응답. 닉네임,접속유지초 를 `|`로 join |
 | `S ➡️ C` | `[RES:SEARCH]` | `[RES:SEARCH]... 검색결과 ...` | `/search` 응답. 결과 없으면 빈 payload |
+
+
+<br>
 
 ### 프로토콜 제약사항 (Design Constraints)
 
@@ -96,7 +99,7 @@ $ ./client 127.0.0.1 8080 User1
 - **POLL 생명주기:** `/bot poll A B` 로 시작 → 투표는 `/bot vote A`(또는 B) → 30초 타임아웃 또는 `/bot poll_end` 수동 종료 중 먼저 발생하는 시점에 결과 브로드캐스트. 진행 중 poll이 있으면 새 poll 시작 요청은 `[ERR]`로 거부.
 - **SEARCH 버퍼:** 대화 기록은 무제한 저장하지 않고 최근 200개만 유지하는 ring buffer로 관리 (메모리/검색 성능 보호).
 - **동시성:** 클라이언트 목록(닉네임/접속시각 포함 구조체)과 대화 기록 버퍼, poll 상태는 모두 공유 자원이므로 각각 `pthread_mutex_t`로 보호. 원본 `clnt_socks[]` 배열은 Phase 2에서 구조체 배열로 교체하면서 mutex를 함께 도입.
-
+<br><br><br>
 
 ### Phase 1: 기초 뼈대
 - [ ] 클라이언트-서버 연결 및 다대다 브로드캐스팅
@@ -129,5 +132,6 @@ $ ./client 127.0.0.1 8080 User1
 - [ ] `/bot dice`, `/bot random_user` — 서버 로직 실행 후 브로드캐스트
 - [ ] `/bot poll` — 생명주기(시작→투표→타임아웃/수동종료) 명세대로 구현, 공유 상태 mutex 보호
 - [ ] 클린 봇 — `[CHAT]` 처리 시 금칙어 필터링 후 치환/차단
+<br><br><br>
 
 과제 제출자: [김지연/정보시스템학과/2022067474]
