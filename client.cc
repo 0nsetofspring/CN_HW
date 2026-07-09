@@ -69,6 +69,49 @@ int contains_mention(const char* text, const char* nickname)
     return 0;
 }
 
+/* /wr(간편 답장)용: 나에게 마지막으로 귓속말을 보낸 사람. 내가 보낸 귓속말
+   ([WHISPER_SENT])에는 반응하지 않고, 받은 귓속말([WHISPER])에서만 갱신한다. */
+char last_whisper_from[MAX_NICK_LEN + 1] = {0,};
+
+/* /wl(최근 귓속말 확인)용 로그. 서버 history와 달리 서버엔 절대 남기지 않고
+   내 클라이언트 메모리에만 저장 - 귓속말 프라이버시 설계를 유지하면서도
+   "내가 받은/보낸 귓속말"은 내 화면에서 다시 볼 수 있게 함. recv_msg
+   쓰레드가 쓰고 메인 쓰레드(/wl)가 읽으므로 mutex로 보호. */
+#define WHISPER_LOG_CAP 20
+char whisper_log[WHISPER_LOG_CAP][BUFSIZE];
+int whisper_log_next = 0;
+int whisper_log_count = 0;
+pthread_mutex_t whisper_log_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void whisper_log_add(const char* line)
+{
+    pthread_mutex_lock(&whisper_log_lock);
+    strncpy(whisper_log[whisper_log_next], line, BUFSIZE - 1);
+    whisper_log[whisper_log_next][BUFSIZE - 1] = '\0';
+    whisper_log_next = (whisper_log_next + 1) % WHISPER_LOG_CAP;
+    if (whisper_log_count < WHISPER_LOG_CAP) whisper_log_count++;
+    pthread_mutex_unlock(&whisper_log_lock);
+}
+
+void print_whisper_log(int n)
+{
+    pthread_mutex_lock(&whisper_log_lock);
+    int count = (n > 0 && n < whisper_log_count) ? n : whisper_log_count;
+    if (count == 0) {
+        pthread_mutex_unlock(&whisper_log_lock);
+        printf("귓속말 기록이 없습니다.\n");
+        return;
+    }
+    int oldest = (whisper_log_next - whisper_log_count + WHISPER_LOG_CAP) % WHISPER_LOG_CAP;
+    int skip = whisper_log_count - count;
+    printf(COLOR_MAGENTA "[최근 귓속말 %d개]" COLOR_RESET "\n", count);
+    for (int i = skip; i < whisper_log_count; i++) {
+        int idx = (oldest + i) % WHISPER_LOG_CAP;
+        printf("  %s\n", whisper_log[idx]);
+    }
+    pthread_mutex_unlock(&whisper_log_lock);
+}
+
 /* fgets()로 한 줄 통째로 읽는 방식이라 화살표 키 등을 눌러도 커서 이동이
    아니라 ESC '[' ... 형태의 raw 바이트가 그대로 입력 버퍼에 섞여 들어간다.
    진짜 커서 이동/히스토리 편집을 지원하려면 readline 같은 라인 에디터가
@@ -140,6 +183,9 @@ void render_incoming(char* msg)
         char* sep = strchr(msg + 14, '|');
         if (sep) {
             *sep = '\0';
+            char log_line[BUFSIZE];
+            snprintf(log_line, sizeof(log_line), "[보냄 -> %s] %s", msg + 14, sep + 1);
+            whisper_log_add(log_line);
             printf(COLOR_MAGENTA "[귓속말 -> %s] ", msg + 14);
             print_markdown_bold(sep + 1);
             printf(COLOR_RESET "\n");
@@ -148,6 +194,11 @@ void render_incoming(char* msg)
         char* sep = strchr(msg + 9, '|');
         if (sep) {
             *sep = '\0';
+            strncpy(last_whisper_from, msg + 9, MAX_NICK_LEN);
+            last_whisper_from[MAX_NICK_LEN] = '\0';
+            char log_line[BUFSIZE];
+            snprintf(log_line, sizeof(log_line), "[받음 <- %s] %s", msg + 9, sep + 1);
+            whisper_log_add(log_line);
             printf("\a" COLOR_MAGENTA "[귓속말 <- %s] ", msg + 9);
             print_markdown_bold(sep + 1);
             printf(COLOR_RESET "\n");
@@ -382,6 +433,8 @@ int main(int argc, char* argv[])
                 "[전체 명령어]\n"
                 "  /name 새이름         닉네임 변경\n"
                 "  /w 대상 메시지       귓속말\n"
+                "  /wr 메시지           마지막으로 받은 귓속말에 바로 답장\n"
+                "  /wl [N]              최근 귓속말 N개 확인 (기본 10개)\n"
                 "  @닉네임 메시지       멘션(비프음)\n"
                 "  /list                접속자 목록\n"
                 "  /search 단어         대화 기록 검색\n"
@@ -431,6 +484,16 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        if (!strcmp(msg, "/wl")) {
+            print_whisper_log(10);
+            continue;
+        }
+        if (0 == strncmp(msg, "/wl ", 4)) {
+            int n = atoi(msg + 4);
+            print_whisper_log(n > 0 ? n : 10);
+            continue;
+        }
+
         char emoji_applied[BUFSIZE];
         char out[BUFSIZE];
         if (!strcmp(msg, "/list")) {
@@ -454,6 +517,13 @@ int main(int argc, char* argv[])
             *sp = '\0';
             apply_emoji_macros(emoji_applied, sizeof(emoji_applied), sp + 1);
             snprintf(out, sizeof(out), "[REQ:WHISPER]%s|%s", rest, emoji_applied);
+        } else if (0 == strncmp(msg, "/wr ", 4)) {
+            if (last_whisper_from[0] == '\0') {
+                printf("받은 귓속말이 없습니다.\n");
+                continue;
+            }
+            apply_emoji_macros(emoji_applied, sizeof(emoji_applied), msg + 4);
+            snprintf(out, sizeof(out), "[REQ:WHISPER]%s|%s", last_whisper_from, emoji_applied);
         } else if (0 == strncmp(msg, "/bot ", 5)) {
             char* rest = msg + 5;
             if (!strcmp(rest, "dice") || !strcmp(rest, "random_user") || !strcmp(rest, "poll_end")) {

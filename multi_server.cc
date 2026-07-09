@@ -20,6 +20,9 @@ typedef struct {
     int fd;
     char nickname[MAX_NICK_LEN + 1];
     time_t join_time;
+    /* 도배 방지용 슬라이딩 윈도우 카운터. rate_limit_check에서만 사용. */
+    time_t window_start;
+    int msg_count;
 } Client;
 
 Client clients[MAX_CLIENT];
@@ -103,6 +106,36 @@ int find_index_by_nickname(const char* nickname)
         if (0 == strcmp(clients[i].nickname, nickname)) return i;
     }
     return -1;
+}
+
+#define RATE_LIMIT_WINDOW_SEC 2
+#define RATE_LIMIT_MAX 5
+
+/* 도배 방지: fd 하나가 RATE_LIMIT_WINDOW_SEC초 동안 RATE_LIMIT_MAX개 넘게
+   보내면 그 이후 메시지는 거부한다. 엔터 연타/매크로로 다른 사람 화면과
+   /search 기록을 순식간에 뒤덮는 것을 막기 위함 - 뮤텍스 경합만으로 서버가
+   죽지는 않지만, 서비스 품질(가독성/기록 보존)은 확실히 망가지므로
+   애플리케이션 레벨에서 막는다. */
+int rate_limit_check(int fd)
+{
+    int allowed = 1;
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&clients_lock);
+    int idx = find_index_by_fd(fd);
+    if (idx != -1) {
+        if (difftime(now, clients[idx].window_start) >= RATE_LIMIT_WINDOW_SEC) {
+            clients[idx].window_start = now;
+            clients[idx].msg_count = 0;
+        }
+        clients[idx].msg_count++;
+        if (clients[idx].msg_count > RATE_LIMIT_MAX) {
+            allowed = 0;
+        }
+    }
+    pthread_mutex_unlock(&clients_lock);
+
+    return allowed;
 }
 
 /* TCP는 바이트 스트림이라 write() 두 번이 상대의 read() 한 번에 합쳐질 수 있다.
@@ -508,7 +541,11 @@ void* handle_clnt(void* arg)
             if (linebuf[i] == '\n') {
                 linebuf[i] = '\0';
                 if (i > start && linebuf[i - 1] == '\r') linebuf[i - 1] = '\0';
-                process_message(clnt_sock, linebuf + start);
+                if (rate_limit_check(clnt_sock)) {
+                    process_message(clnt_sock, linebuf + start);
+                } else {
+                    send_to(clnt_sock, "[ERR]메시지를 너무 빨리 보내고 있습니다. 잠시 후 다시 시도하세요.");
+                }
                 start = i + 1;
             }
         }
@@ -605,6 +642,8 @@ int main(int argc, char* argv[])
         clients[clnt_cnt].fd = clnt_sock;
         clients[clnt_cnt].nickname[0] = '\0';
         clients[clnt_cnt].join_time = time(NULL);
+        clients[clnt_cnt].window_start = time(NULL);
+        clients[clnt_cnt].msg_count = 0;
         clnt_cnt++;
         pthread_mutex_unlock(&clients_lock);
 
