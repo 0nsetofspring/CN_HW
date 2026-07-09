@@ -6,6 +6,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <pthread.h>
+#include <signal.h>
 
 #define BUFSIZE 1024
 #define MAX_CLIENT  64
@@ -76,6 +77,10 @@ int main(int argc, char* argv[])
         printf("Usage : %s <port>\n", argv[0]);
         exit(1);
     }
+
+    /* 브로드캐스팅 중 대상 소켓이 이미 끊긴 상태로 write()하면 SIGPIPE로
+       서버 프로세스 전체가 죽는다. 무시하고 write()의 -1 반환으로만 처리한다. */
+    signal(SIGPIPE, SIG_IGN);
 
     serv_sock = socket(PF_INET, SOCK_STREAM, 0);    /* 서버 소켓 생성 */
 
