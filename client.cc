@@ -69,6 +69,29 @@ int contains_mention(const char* text, const char* nickname)
     return 0;
 }
 
+/* fgets()로 한 줄 통째로 읽는 방식이라 화살표 키 등을 눌러도 커서 이동이
+   아니라 ESC '[' ... 형태의 raw 바이트가 그대로 입력 버퍼에 섞여 들어간다.
+   진짜 커서 이동/히스토리 편집을 지원하려면 readline 같은 라인 에디터가
+   필요하지만, 최소한 이 깨진 바이트가 채팅 메시지에 노출되지 않도록
+   CSI 시퀀스(ESC '[' ... 알파벳)를 통째로 걸러낸다. */
+void strip_escape_sequences(char* text)
+{
+    char* src = text;
+    char* dst = text;
+    while (*src) {
+        if (*src == '\x1b' && *(src + 1) == '[') {
+            src += 2;
+            while (*src && !((*src >= 'A' && *src <= 'Z') || (*src >= 'a' && *src <= 'z'))) {
+                src++;
+            }
+            if (*src) src++;
+            continue;
+        }
+        *dst++ = *src++;
+    }
+    *dst = '\0';
+}
+
 void print_timestamp(void)
 {
     time_t now = time(NULL);
@@ -254,7 +277,7 @@ void print_motd(void)
     printf(COLOR_BLUE
         "==================================================\n"
         " CN_CHAT 에 오신 것을 환영합니다!\n"
-        " /name /w /quit(q) /clear /list /search /alias /bot\n"
+        " 전체 명령어는 /help 를 입력해보세요.\n"
         " (하트), (따봉) 처럼 입력하면 이모티콘으로 바뀌어요.\n"
         "==================================================\n"
         COLOR_RESET);
@@ -346,12 +369,32 @@ int main(int argc, char* argv[])
 
     while (fgets(msg, sizeof(msg), stdin) != NULL) {
         msg[strcspn(msg, "\n")] = 0;
+        strip_escape_sequences(msg);
 
         if (!strcmp(msg, "/quit") || !strcmp(msg, "q")) {
             break;
         }
 
         if (strlen(msg) == 0) continue;
+
+        if (!strcmp(msg, "/help")) {
+            printf(
+                "[전체 명령어]\n"
+                "  /name 새이름         닉네임 변경\n"
+                "  /w 대상 메시지       귓속말\n"
+                "  @닉네임 메시지       멘션(비프음)\n"
+                "  /list                접속자 목록\n"
+                "  /search 단어         대화 기록 검색\n"
+                "  /alias 단축 원본     단축어 등록\n"
+                "  /aliases             내 단축어 목록\n"
+                "  /bot                 봇 명령어 안내\n"
+                "  /clear               화면 지우기\n"
+                "  /quit 또는 q         종료\n"
+                "  (하트)(따봉)(웃음)(눈물)  이모티콘 매크로\n"
+                "  **텍스트**           굵게 표시\n"
+            );
+            continue;
+        }
 
         if (!strcmp(msg, "/clear")) {
             /* 커서를 좌상단으로 이동 + 화면 전체 지우기 (ANSI escape) */

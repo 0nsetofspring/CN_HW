@@ -389,7 +389,7 @@ void handle_bot_poll_start(int clnt_sock, char* payload)
     poll.active = 1;
     started = 1;
     snprintf(sys_msg, sizeof(sys_msg),
-             "[SYS]\xF0\x9F\x93\x8A 투표 시작! A) %s  vs  B) %s  (/bot vote A 또는 /bot vote B, 30초 후 자동 마감)",
+             "[SYS]\xF0\x9F\x93\x8A 투표 시작! A) %s  vs  B) %s  (/bot vote A 또는 /bot vote B, 1인 1표·변경 불가, 30초 후 자동 마감)",
              poll.option_a, poll.option_b);
     pthread_mutex_unlock(&poll_lock);
 
@@ -438,7 +438,7 @@ void handle_bot_vote(int clnt_sock, const char* option)
         send_to(clnt_sock, "[ERR]A 또는 B로 투표해주세요. (/bot vote A)");
         return;
     }
-    send_to(clnt_sock, "[SYS]투표가 반영되었습니다.");
+    send_to(clnt_sock, "[SYS]투표가 반영되었습니다. (이후 변경 불가)");
 }
 
 void handle_bot(int clnt_sock, char* payload)
