@@ -26,6 +26,25 @@ Client clients[MAX_CLIENT];
 int clnt_cnt = 0;
 pthread_mutex_t clients_lock = PTHREAD_MUTEX_INITIALIZER;
 
+/* /search 용 대화 기록. 무제한 저장하면 메모리/검색 성능이 나빠지므로
+   최근 HISTORY_CAP개만 원형 버퍼로 유지한다. 귓속말은 사적인 대화라
+   여기 남기지 않고 [CHAT](공개 채팅)만 기록한다. */
+#define HISTORY_CAP 200
+char history[HISTORY_CAP][BUFSIZE];
+int history_next = 0;
+int history_count = 0;
+pthread_mutex_t history_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void history_add(const char* line)
+{
+    pthread_mutex_lock(&history_lock);
+    strncpy(history[history_next], line, BUFSIZE - 1);
+    history[history_next][BUFSIZE - 1] = '\0';
+    history_next = (history_next + 1) % HISTORY_CAP;
+    if (history_count < HISTORY_CAP) history_count++;
+    pthread_mutex_unlock(&history_lock);
+}
+
 void error_handling(const char *message)
 {
     fputs(message, stderr);
@@ -129,7 +148,66 @@ void handle_chat(int clnt_sock, const char* text)
     pthread_mutex_unlock(&clients_lock);
 
     snprintf(out, sizeof(out), "%s: %s", nickname, text);
+    history_add(out);
     broadcast(out, clnt_sock);
+}
+
+/* [RES:LIST] payload 형식: "닉네임1,접속유지초|닉네임2,접속유지초|...".
+   닉네임을 아직 등록 안 한 접속(핸드셰이크 중)은 목록에서 제외. */
+void handle_list(int clnt_sock)
+{
+    char out[BUFSIZE] = "[RES:LIST]";
+    char entry[64];
+    time_t now = time(NULL);
+
+    pthread_mutex_lock(&clients_lock);
+    for (int i = 0; i < clnt_cnt; i++) {
+        if (clients[i].nickname[0] == '\0') continue;
+
+        long elapsed = (long)difftime(now, clients[i].join_time);
+        snprintf(entry, sizeof(entry), "%s%s,%ld",
+                 (strlen(out) > 10) ? "|" : "", clients[i].nickname, elapsed);
+
+        /* MAX_CLIENT가 다 차면 한 줄이 BUFSIZE를 넘을 수 있어 안전하게 자른다. */
+        if (strlen(out) + strlen(entry) < sizeof(out) - 1) {
+            strcat(out, entry);
+        }
+    }
+    pthread_mutex_unlock(&clients_lock);
+
+    send_to(clnt_sock, out);
+}
+
+/* keyword가 포함된 과거 채팅 라인들을 [RES:SEARCH] 메시지로 하나씩 보낸다.
+   결과를 '|' 등으로 합쳐 보내지 않는 이유: 채팅 내용 자체에 '|'가 자유롭게
+   들어갈 수 있어(닉네임과 달리 금지하지 않음) 한 줄로 합치면 클라이언트가
+   각 결과를 다시 정확히 나눌 방법이 없다. 매칭 건수만큼 개행으로 프레이밍된
+   메시지를 반복 전송하면 이 문제가 아예 생기지 않는다. */
+void handle_search(int clnt_sock, const char* keyword)
+{
+    if (keyword[0] == '\0') {
+        send_to(clnt_sock, "[ERR]검색어를 입력해주세요.");
+        return;
+    }
+
+    char out[BUFSIZE];
+    int match_count = 0;
+
+    pthread_mutex_lock(&history_lock);
+    int oldest = (history_next - history_count + HISTORY_CAP) % HISTORY_CAP;
+    for (int i = 0; i < history_count; i++) {
+        int idx = (oldest + i) % HISTORY_CAP;
+        if (strstr(history[idx], keyword) != NULL) {
+            snprintf(out, sizeof(out), "[RES:SEARCH]%s", history[idx]);
+            send_to(clnt_sock, out);
+            match_count++;
+        }
+    }
+    pthread_mutex_unlock(&history_lock);
+
+    if (match_count == 0) {
+        send_to(clnt_sock, "[RES:SEARCH]");
+    }
 }
 
 /* payload 형식: "대상|할말". target에는 이미 '|'/공백이 금지돼 있으므로 첫
@@ -183,6 +261,10 @@ void process_message(int clnt_sock, char* msg)
         handle_chat(clnt_sock, msg + 6);
     } else if (0 == strncmp(msg, "[REQ:WHISPER]", 13)) {
         handle_whisper(clnt_sock, msg + 13);
+    } else if (0 == strncmp(msg, "[REQ:LIST]", 10)) {
+        handle_list(clnt_sock);
+    } else if (0 == strncmp(msg, "[REQ:SEARCH]", 12)) {
+        handle_search(clnt_sock, msg + 12);
     } else {
         send_to(clnt_sock, "[ERR]알 수 없는 명령입니다.");
     }

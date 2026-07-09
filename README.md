@@ -86,7 +86,7 @@ $ ./client 127.0.0.1 8080 User1
 | `S ➡️ C` | `[SYS]` | `[SYS]OOO님 입장` | 클라이언트 단에서 파란색 시스템 테마로 렌더링 |
 | `S ➡️ C` | `[ERR]` | `[ERR]잘못된 명령어` | 클라이언트 단에서 붉은색 에러 테마로 렌더링 |
 | `S ➡️ C` | `[RES:LIST]` | `[RES:LIST]user1,120\|user2,45` | `/list` 응답. 닉네임,접속유지초 를 `|`로 join |
-| `S ➡️ C` | `[RES:SEARCH]` | `[RES:SEARCH]... 검색결과 ...` | `/search` 응답. 결과 없으면 빈 payload |
+| `S ➡️ C` | `[RES:SEARCH]` | `[RES:SEARCH]닉네임: 내용` | `/search` 응답. 채팅 내용에 `|` 제약이 없어 여러 결과를 한 줄로 합치지 않고, 매칭 건수만큼 메시지를 반복 전송. 결과 없으면 빈 payload 1개 |
 | `S ➡️ C` | `[WHISPER]` | `[WHISPER]보낸이\|할말` | 귓속말 수신 측에게만 전달. 클라이언트가 비프음(`\a`) 처리 |
 | `S ➡️ C` | `[WHISPER_SENT]` | `[WHISPER_SENT]받는이\|할말` | 귓속말을 보낸 본인에게 전송 확인용으로 에코 |
 

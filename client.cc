@@ -129,6 +129,32 @@ void render_incoming(char* msg)
             print_markdown_bold(sep + 1);
             printf(COLOR_RESET "\n");
         }
+    } else if (0 == strncmp(msg, "[RES:LIST]", 10)) {
+        char* payload = msg + 10;
+        if (payload[0] == '\0') {
+            printf("(접속 중인 유저 없음)\n");
+        } else {
+            printf(COLOR_BLUE "[접속자 목록]" COLOR_RESET "\n");
+            char* tok = strtok(payload, "|");
+            while (tok != NULL) {
+                char* comma = strchr(tok, ',');
+                if (comma) {
+                    *comma = '\0';
+                    long sec = atol(comma + 1);
+                    printf("  - %s (%ld분 %ld초 접속 중)\n", tok, sec / 60, sec % 60);
+                }
+                tok = strtok(NULL, "|");
+            }
+        }
+    } else if (0 == strncmp(msg, "[RES:SEARCH]", 12)) {
+        char* payload = msg + 12;
+        if (payload[0] == '\0') {
+            printf("(검색 결과 없음)\n");
+        } else {
+            printf(COLOR_YELLOW "[검색결과] " COLOR_RESET);
+            print_markdown_bold(payload);
+            printf("\n");
+        }
     } else if (contains_mention(msg, my_nickname)) {
         printf("\a" COLOR_YELLOW "[멘션됨] ");
         print_markdown_bold(msg);
@@ -303,7 +329,11 @@ int main(int argc, char* argv[])
 
         char emoji_applied[BUFSIZE];
         char out[BUFSIZE];
-        if (0 == strncmp(msg, "/name ", 6)) {
+        if (!strcmp(msg, "/list")) {
+            snprintf(out, sizeof(out), "[REQ:LIST]");
+        } else if (0 == strncmp(msg, "/search ", 8)) {
+            snprintf(out, sizeof(out), "[REQ:SEARCH]%s", msg + 8);
+        } else if (0 == strncmp(msg, "/name ", 6)) {
             const char* new_name = msg + 6;
             snprintf(out, sizeof(out), "[REQ:NAME]%s", new_name);
             if (is_valid_nickname(new_name)) {
