@@ -173,10 +173,18 @@ void print_markdown_bold(const char* text)
    볼드만 해석해 출력하되, 내 닉네임이 멘션됐으면 강조 + 비프음('\a') 처리. */
 void render_incoming(char* msg)
 {
+    /* 시스템 알림은 일반 채팅 사이에 섞이면 눈에 잘 안 띄어서, 앞뒤로 여백과
+       구분선을 둬서 채팅 로그와 시각적으로 확실히 구분되게 한다. */
+    int is_sys = (0 == strncmp(msg, "[SYS]", 5));
+    if (is_sys) {
+        printf("\n" COLOR_BLUE "----------------------------------------" COLOR_RESET "\n");
+    }
+
     print_timestamp();
 
-    if (0 == strncmp(msg, "[SYS]", 5)) {
+    if (is_sys) {
         printf(COLOR_BLUE "[SYSTEM] %s" COLOR_RESET "\n", msg + 5);
+        printf(COLOR_BLUE "----------------------------------------" COLOR_RESET "\n\n");
     } else if (0 == strncmp(msg, "[ERR]", 5)) {
         printf(COLOR_RED "[ERROR] %s" COLOR_RESET "\n", msg + 5);
     } else if (0 == strncmp(msg, "[WHISPER_SENT]", 14)) {

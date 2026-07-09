@@ -188,6 +188,18 @@ void handle_name_change(int clnt_sock, const char* new_name)
         pthread_mutex_unlock(&clients_lock);
         return;
     }
+    /* 중복 닉네임을 허용하면 /w, /list, @멘션이 전부 어느 쪽을 가리키는지
+       모호해진다(find_index_by_nickname은 먼저 찾은 사람만 반환). 자기 자신의
+       현재 닉네임으로 다시 등록하는 건 막지 않는다(no-op 허용). check-and-set을
+       같은 lock 구간에서 처리해 동시에 같은 이름을 채가는 레이스도 막는다. */
+    int dup_idx = find_index_by_nickname(new_name);
+    if (dup_idx != -1 && dup_idx != idx) {
+        pthread_mutex_unlock(&clients_lock);
+        char err[BUFSIZE];
+        snprintf(err, sizeof(err), "[ERR]이미 사용 중인 닉네임입니다: %s", new_name);
+        send_to(clnt_sock, err);
+        return;
+    }
     is_first = (clients[idx].nickname[0] == '\0');
     strcpy(old_name, clients[idx].nickname);
     strncpy(clients[idx].nickname, new_name, MAX_NICK_LEN);
