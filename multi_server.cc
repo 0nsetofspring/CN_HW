@@ -45,6 +45,41 @@ void history_add(const char* line)
     pthread_mutex_unlock(&history_lock);
 }
 
+/* /bot poll 상태. 서버 전체에 진행 중인 투표는 하나뿐이라고 가정(동시에 두
+   개를 돌릴 이유가 없어 단순화). 시작~투표~마감을 모두 poll_lock으로 보호. */
+typedef struct {
+    int active;
+    char option_a[64];
+    char option_b[64];
+    int votes_a;
+    int votes_b;
+    char voters[MAX_CLIENT][MAX_NICK_LEN + 1];
+    int voter_count;
+} Poll;
+
+Poll poll;
+pthread_mutex_t poll_lock = PTHREAD_MUTEX_INITIALIZER;
+
+/* 클린 봇: [CHAT] 브로드캐스트 전에 금칙어를 '#'으로 치환한다.
+   '*'를 쓰면 클라이언트의 마크다운 볼드 파서("**...**")가 연속된 별표를
+   볼드 마커로 잘못 해석해 화면이 깨진다(실제로 테스트에서 발견된 문제).
+   '#'은 마크다운 문법과 안 겹쳐서 안전하다. */
+const char* BANNED_WORDS[] = {"시발", "개새끼", "병신", "ㅅㅂ"};
+#define BANNED_WORD_COUNT (sizeof(BANNED_WORDS) / sizeof(BANNED_WORDS[0]))
+
+void censor_text(char* text)
+{
+    for (size_t w = 0; w < BANNED_WORD_COUNT; w++) {
+        const char* word = BANNED_WORDS[w];
+        size_t wlen = strlen(word);
+        char* p = text;
+        while ((p = strstr(p, word)) != NULL) {
+            for (size_t i = 0; i < wlen; i++) p[i] = '#';
+            p += wlen;
+        }
+    }
+}
+
 void error_handling(const char *message)
 {
     fputs(message, stderr);
@@ -138,7 +173,12 @@ void handle_name_change(int clnt_sock, const char* new_name)
 void handle_chat(int clnt_sock, const char* text)
 {
     char nickname[MAX_NICK_LEN + 1] = "익명";
+    char censored[BUFSIZE];
     char out[BUFSIZE];
+
+    strncpy(censored, text, sizeof(censored) - 1);
+    censored[sizeof(censored) - 1] = '\0';
+    censor_text(censored);
 
     pthread_mutex_lock(&clients_lock);
     int idx = find_index_by_fd(clnt_sock);
@@ -147,7 +187,7 @@ void handle_chat(int clnt_sock, const char* text)
     }
     pthread_mutex_unlock(&clients_lock);
 
-    snprintf(out, sizeof(out), "%s: %s", nickname, text);
+    snprintf(out, sizeof(out), "%s: %s", nickname, censored);
     history_add(out);
     broadcast(out, clnt_sock);
 }
@@ -253,6 +293,171 @@ void handle_whisper(int clnt_sock, char* payload)
     }
 }
 
+void handle_bot_dice(int clnt_sock)
+{
+    char nickname[MAX_NICK_LEN + 1] = "누군가";
+    pthread_mutex_lock(&clients_lock);
+    int idx = find_index_by_fd(clnt_sock);
+    if (idx != -1 && clients[idx].nickname[0] != '\0') strcpy(nickname, clients[idx].nickname);
+    pthread_mutex_unlock(&clients_lock);
+
+    int roll = (rand() % 100) + 1;
+    char sys_msg[BUFSIZE];
+    snprintf(sys_msg, sizeof(sys_msg), "[SYS]\xF0\x9F\x8E\xB2 %s님이 주사위를 굴려 %d가 나왔습니다!", nickname, roll);
+    broadcast(sys_msg, -1);
+}
+
+void handle_bot_random_user(int clnt_sock)
+{
+    char picked[MAX_NICK_LEN + 1] = {0,};
+
+    pthread_mutex_lock(&clients_lock);
+    int candidates[MAX_CLIENT];
+    int cand_cnt = 0;
+    for (int i = 0; i < clnt_cnt; i++) {
+        if (clients[i].nickname[0] != '\0') candidates[cand_cnt++] = i;
+    }
+    if (cand_cnt > 0) {
+        strcpy(picked, clients[candidates[rand() % cand_cnt]].nickname);
+    }
+    pthread_mutex_unlock(&clients_lock);
+
+    if (picked[0] == '\0') {
+        send_to(clnt_sock, "[ERR]추첨할 유저가 없습니다.");
+        return;
+    }
+    char sys_msg[BUFSIZE];
+    snprintf(sys_msg, sizeof(sys_msg), "[SYS]\xF0\x9F\x8E\xAF 랜덤 추첨 결과: %s님이 당첨되었습니다!", picked);
+    broadcast(sys_msg, -1);
+}
+
+/* poll이 진행 중이면 종료하고 결과를 브로드캐스트. 30초 타임아웃 쓰레드와
+   /bot poll_end 수동 종료가 동시에 호출해도, 먼저 lock을 잡고 active를 0으로
+   내린 쪽만 실제로 방송하고 나머지는 조용히 리턴한다(중복 방송 방지). */
+void end_poll_if_active(const char* reason)
+{
+    char sys_msg[BUFSIZE];
+    int ended = 0;
+
+    pthread_mutex_lock(&poll_lock);
+    if (poll.active) {
+        snprintf(sys_msg, sizeof(sys_msg),
+                 "[SYS]\xF0\x9F\x93\x8A 투표 종료(%s) - %s: %d표 / %s: %d표",
+                 reason, poll.option_a, poll.votes_a, poll.option_b, poll.votes_b);
+        poll.active = 0;
+        ended = 1;
+    }
+    pthread_mutex_unlock(&poll_lock);
+
+    if (ended) broadcast(sys_msg, -1);
+}
+
+void* poll_timeout_thread(void* arg)
+{
+    (void)arg;
+    sleep(30);
+    end_poll_if_active("30초 자동 마감");
+    return NULL;
+}
+
+/* payload 형식: "A선택지|B선택지" */
+void handle_bot_poll_start(int clnt_sock, char* payload)
+{
+    char* sep = strchr(payload, '|');
+    if (sep == NULL) {
+        send_to(clnt_sock, "[ERR]투표 형식이 올바르지 않습니다. /bot poll A B");
+        return;
+    }
+    *sep = '\0';
+
+    int started = 0;
+    char sys_msg[BUFSIZE];
+
+    pthread_mutex_lock(&poll_lock);
+    if (poll.active) {
+        pthread_mutex_unlock(&poll_lock);
+        send_to(clnt_sock, "[ERR]이미 진행 중인 투표가 있습니다.");
+        return;
+    }
+    strncpy(poll.option_a, payload, sizeof(poll.option_a) - 1);
+    poll.option_a[sizeof(poll.option_a) - 1] = '\0';
+    strncpy(poll.option_b, sep + 1, sizeof(poll.option_b) - 1);
+    poll.option_b[sizeof(poll.option_b) - 1] = '\0';
+    poll.votes_a = 0;
+    poll.votes_b = 0;
+    poll.voter_count = 0;
+    poll.active = 1;
+    started = 1;
+    snprintf(sys_msg, sizeof(sys_msg),
+             "[SYS]\xF0\x9F\x93\x8A 투표 시작! A) %s  vs  B) %s  (/bot vote A 또는 /bot vote B, 30초 후 자동 마감)",
+             poll.option_a, poll.option_b);
+    pthread_mutex_unlock(&poll_lock);
+
+    if (started) {
+        broadcast(sys_msg, -1);
+        pthread_t t;
+        pthread_create(&t, NULL, poll_timeout_thread, NULL);
+        pthread_detach(t);
+    }
+}
+
+void handle_bot_vote(int clnt_sock, const char* option)
+{
+    char voter[MAX_NICK_LEN + 1] = {0,};
+
+    pthread_mutex_lock(&clients_lock);
+    int idx = find_index_by_fd(clnt_sock);
+    if (idx != -1) strcpy(voter, clients[idx].nickname);
+    pthread_mutex_unlock(&clients_lock);
+
+    if (voter[0] == '\0') return;
+
+    pthread_mutex_lock(&poll_lock);
+    if (!poll.active) {
+        pthread_mutex_unlock(&poll_lock);
+        send_to(clnt_sock, "[ERR]진행 중인 투표가 없습니다.");
+        return;
+    }
+    for (int i = 0; i < poll.voter_count; i++) {
+        if (0 == strcmp(poll.voters[i], voter)) {
+            pthread_mutex_unlock(&poll_lock);
+            send_to(clnt_sock, "[ERR]이미 투표하셨습니다.");
+            return;
+        }
+    }
+    int matched = 0;
+    if (0 == strcmp(option, "A")) { poll.votes_a++; matched = 1; }
+    else if (0 == strcmp(option, "B")) { poll.votes_b++; matched = 1; }
+    if (matched && poll.voter_count < MAX_CLIENT) {
+        strcpy(poll.voters[poll.voter_count], voter);
+        poll.voter_count++;
+    }
+    pthread_mutex_unlock(&poll_lock);
+
+    if (!matched) {
+        send_to(clnt_sock, "[ERR]A 또는 B로 투표해주세요. (/bot vote A)");
+        return;
+    }
+    send_to(clnt_sock, "[SYS]투표가 반영되었습니다.");
+}
+
+void handle_bot(int clnt_sock, char* payload)
+{
+    if (0 == strcmp(payload, "dice")) {
+        handle_bot_dice(clnt_sock);
+    } else if (0 == strcmp(payload, "random_user")) {
+        handle_bot_random_user(clnt_sock);
+    } else if (0 == strcmp(payload, "poll_end")) {
+        end_poll_if_active("수동 종료");
+    } else if (0 == strncmp(payload, "poll ", 5)) {
+        handle_bot_poll_start(clnt_sock, payload + 5);
+    } else if (0 == strncmp(payload, "vote ", 5)) {
+        handle_bot_vote(clnt_sock, payload + 5);
+    } else {
+        send_to(clnt_sock, "[ERR]알 수 없는 봇 명령입니다. (dice/random_user/poll/vote/poll_end)");
+    }
+}
+
 void process_message(int clnt_sock, char* msg)
 {
     if (0 == strncmp(msg, "[REQ:NAME]", 10)) {
@@ -265,6 +470,8 @@ void process_message(int clnt_sock, char* msg)
         handle_list(clnt_sock);
     } else if (0 == strncmp(msg, "[REQ:SEARCH]", 12)) {
         handle_search(clnt_sock, msg + 12);
+    } else if (0 == strncmp(msg, "[REQ:BOT]", 9)) {
+        handle_bot(clnt_sock, msg + 9);
     } else {
         send_to(clnt_sock, "[ERR]알 수 없는 명령입니다.");
     }
@@ -354,6 +561,8 @@ int main(int argc, char* argv[])
     /* 브로드캐스팅 중 대상 소켓이 이미 끊긴 상태로 write()하면 SIGPIPE로
        서버 프로세스 전체가 죽는다. 무시하고 write()의 -1 반환으로만 처리한다. */
     signal(SIGPIPE, SIG_IGN);
+
+    srand((unsigned int)time(NULL));
 
     serv_sock = socket(PF_INET, SOCK_STREAM, 0);    /* 서버 소켓 생성 */
 

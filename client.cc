@@ -254,10 +254,43 @@ void print_motd(void)
     printf(COLOR_BLUE
         "==================================================\n"
         " CN_CHAT 에 오신 것을 환영합니다!\n"
-        " /name /w /quit(q) /clear 명령어를 사용할 수 있어요.\n"
+        " /name /w /quit(q) /clear /list /search /alias /bot\n"
         " (하트), (따봉) 처럼 입력하면 이모티콘으로 바뀌어요.\n"
         "==================================================\n"
         COLOR_RESET);
+}
+
+/* 단축어는 순전히 로컬 기능이라 서버로 보내지 않는다 - 채팅창에 단축을
+   그대로 입력하면 전송 직전에 등록된 원문으로 풀어서 보낸다. */
+#define MAX_ALIAS 64
+typedef struct { char shortcut[32]; char expansion[BUFSIZE]; } Alias;
+Alias aliases[MAX_ALIAS];
+int alias_count = 0;
+
+void add_alias(const char* shortcut, const char* expansion)
+{
+    for (int i = 0; i < alias_count; i++) {
+        if (0 == strcmp(aliases[i].shortcut, shortcut)) {
+            strncpy(aliases[i].expansion, expansion, BUFSIZE - 1);
+            aliases[i].expansion[BUFSIZE - 1] = '\0';
+            return;
+        }
+    }
+    if (alias_count < MAX_ALIAS) {
+        strncpy(aliases[alias_count].shortcut, shortcut, sizeof(aliases[0].shortcut) - 1);
+        aliases[alias_count].shortcut[sizeof(aliases[0].shortcut) - 1] = '\0';
+        strncpy(aliases[alias_count].expansion, expansion, BUFSIZE - 1);
+        aliases[alias_count].expansion[BUFSIZE - 1] = '\0';
+        alias_count++;
+    }
+}
+
+const char* find_alias(const char* shortcut)
+{
+    for (int i = 0; i < alias_count; i++) {
+        if (0 == strcmp(aliases[i].shortcut, shortcut)) return aliases[i].expansion;
+    }
+    return NULL;
 }
 
 int main(int argc, char* argv[])
@@ -327,6 +360,34 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        if (0 == strncmp(msg, "/alias ", 7)) {
+            char* rest = msg + 7;
+            char* sp = strchr(rest, ' ');
+            if (sp == NULL) {
+                printf("사용법: /alias 단축 원본\n");
+                continue;
+            }
+            *sp = '\0';
+            add_alias(rest, sp + 1);
+            printf("단축어 등록: %s -> %s\n", rest, sp + 1);
+            continue;
+        }
+        if (!strcmp(msg, "/aliases")) {
+            if (alias_count == 0) {
+                printf("등록된 단축어가 없습니다.\n");
+            } else {
+                printf("[내 단축어 목록]\n");
+                for (int i = 0; i < alias_count; i++) {
+                    printf("  %s -> %s\n", aliases[i].shortcut, aliases[i].expansion);
+                }
+            }
+            continue;
+        }
+        if (!strcmp(msg, "/bot")) {
+            printf("[봇 명령어] /bot dice | /bot random_user | /bot poll A B | /bot vote A(또는 B) | /bot poll_end\n");
+            continue;
+        }
+
         char emoji_applied[BUFSIZE];
         char out[BUFSIZE];
         if (!strcmp(msg, "/list")) {
@@ -350,8 +411,29 @@ int main(int argc, char* argv[])
             *sp = '\0';
             apply_emoji_macros(emoji_applied, sizeof(emoji_applied), sp + 1);
             snprintf(out, sizeof(out), "[REQ:WHISPER]%s|%s", rest, emoji_applied);
+        } else if (0 == strncmp(msg, "/bot ", 5)) {
+            char* rest = msg + 5;
+            if (!strcmp(rest, "dice") || !strcmp(rest, "random_user") || !strcmp(rest, "poll_end")) {
+                snprintf(out, sizeof(out), "[REQ:BOT]%s", rest);
+            } else if (0 == strncmp(rest, "poll ", 5)) {
+                char* opts = rest + 5;
+                char* sp = strchr(opts, ' ');
+                if (sp == NULL) {
+                    printf("사용법: /bot poll A B\n");
+                    continue;
+                }
+                *sp = '\0';
+                snprintf(out, sizeof(out), "[REQ:BOT]poll %s|%s", opts, sp + 1);
+            } else if (0 == strncmp(rest, "vote ", 5)) {
+                snprintf(out, sizeof(out), "[REQ:BOT]vote %s", rest + 5);
+            } else {
+                printf("알 수 없는 봇 명령입니다. /bot 을 입력해 도움말을 확인하세요.\n");
+                continue;
+            }
         } else {
-            apply_emoji_macros(emoji_applied, sizeof(emoji_applied), msg);
+            /* 입력한 줄 전체가 등록된 단축어와 정확히 일치하면 원문으로 풀어서 보낸다. */
+            const char* expanded = find_alias(msg);
+            apply_emoji_macros(emoji_applied, sizeof(emoji_applied), expanded ? expanded : msg);
             snprintf(out, sizeof(out), "[CHAT]%s", emoji_applied);
         }
         send_line(out);
