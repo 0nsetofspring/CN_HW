@@ -42,6 +42,15 @@ int find_index_by_fd(int fd)
     return -1;
 }
 
+/* clients_lock을 이미 보유한 상태에서만 호출할 것. */
+int find_index_by_nickname(const char* nickname)
+{
+    for (int i = 0; i < clnt_cnt; i++) {
+        if (0 == strcmp(clients[i].nickname, nickname)) return i;
+    }
+    return -1;
+}
+
 /* TCP는 바이트 스트림이라 write() 두 번이 상대의 read() 한 번에 합쳐질 수 있다.
    그래서 모든 메시지 끝에 '\n'을 붙여 전송하고, 받는 쪽은 '\n' 단위로 잘라
    읽는다(아래 handle_clnt 참고). 이 함수들이 그 프레이밍을 전담한다. */
@@ -123,12 +132,57 @@ void handle_chat(int clnt_sock, const char* text)
     broadcast(out, clnt_sock);
 }
 
+/* payload 형식: "대상|할말". target에는 이미 '|'/공백이 금지돼 있으므로 첫
+   '|' 는 반드시 우리가 클라이언트에서 삽입한 구분자다. 할말 안에 '|'가 더
+   있어도 최초 1개만 잘라 안전하게 분리된다. */
+void handle_whisper(int clnt_sock, char* payload)
+{
+    char* sep = strchr(payload, '|');
+    if (sep == NULL) {
+        send_to(clnt_sock, "[ERR]귓속말 형식이 올바르지 않습니다. /w 대상 메시지");
+        return;
+    }
+    *sep = '\0';
+    const char* target = payload;
+    const char* text = sep + 1;
+
+    char to_target[BUFSIZE];
+    char to_sender[BUFSIZE];
+    int found = 0;
+
+    /* 대상의 fd를 락 밖으로 들고 나가 write()하면, 그 사이 대상이 접속을
+       끊고 fd가 다른 신규 클라이언트에게 재사용될 경우 엉뚱한 사람에게
+       귓속말이 전달될 수 있다. 조회~전송을 같은 lock 구간에서 처리한다. */
+    pthread_mutex_lock(&clients_lock);
+    int self_idx = find_index_by_fd(clnt_sock);
+    int target_idx = find_index_by_nickname(target);
+    if (self_idx != -1 && target_idx != -1) {
+        found = 1;
+        snprintf(to_target, sizeof(to_target), "[WHISPER]%s|%s", clients[self_idx].nickname, text);
+        snprintf(to_sender, sizeof(to_sender), "[WHISPER_SENT]%s|%s", clients[target_idx].nickname, text);
+        int target_fd = clients[target_idx].fd;
+        write(target_fd, to_target, strlen(to_target));
+        write(target_fd, "\n", 1);
+    }
+    pthread_mutex_unlock(&clients_lock);
+
+    if (found) {
+        send_to(clnt_sock, to_sender);
+    } else {
+        char err[BUFSIZE];
+        snprintf(err, sizeof(err), "[ERR]대상을 찾을 수 없습니다: %s", target);
+        send_to(clnt_sock, err);
+    }
+}
+
 void process_message(int clnt_sock, char* msg)
 {
     if (0 == strncmp(msg, "[REQ:NAME]", 10)) {
         handle_name_change(clnt_sock, msg + 10);
     } else if (0 == strncmp(msg, "[CHAT]", 6)) {
         handle_chat(clnt_sock, msg + 6);
+    } else if (0 == strncmp(msg, "[REQ:WHISPER]", 13)) {
+        handle_whisper(clnt_sock, msg + 13);
     } else {
         send_to(clnt_sock, "[ERR]알 수 없는 명령입니다.");
     }

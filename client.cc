@@ -8,8 +8,13 @@
 #include <signal.h>
 
 #define BUFSIZE 1024
+#define MAX_NICK_LEN 20
 
 int sock;
+/* 멘션(@닉네임) 감지와 귓속말 표시(누구에게 보냈는지)에 필요해서 클라이언트도
+   자신의 현재 닉네임을 들고 있는다. 서버 검증 결과를 기다리지 않고, /name
+   입력이 로컬 규칙(is_valid_nickname)을 통과하면 낙관적으로 갱신한다. */
+char my_nickname[MAX_NICK_LEN + 1];
 
 void error_handling(const char *message)
 {
@@ -18,14 +23,67 @@ void error_handling(const char *message)
     exit(-1);
 }
 
-/* [SYS]/[ERR] 태그가 붙은 서버 메시지는 태그를 떼고 구분되게 보여준다.
-   태그 없는 일반 브로드캐스팅(닉네임: 내용)은 그대로 출력. */
-void render_incoming(const char* msg)
+/* 서버와 동일한 규칙(공백/'|' 금지, 20자 이하)을 클라이언트에서도 확인해
+   my_nickname을 잘못 갱신하지 않도록 한다. */
+int is_valid_nickname(const char* name)
+{
+    size_t len = strlen(name);
+    if (len == 0 || len > MAX_NICK_LEN) return 0;
+    for (size_t i = 0; i < len; i++) {
+        if (name[i] == '|' || name[i] == ' ') return 0;
+    }
+    return 1;
+}
+
+/* '@닉네임' 뒤가 boundary 문자(공백/문장부호/끝)일 때만 멘션으로 인정한다.
+   한글 조사가 곧바로 붙는 경우(예: "@길동아")는 UTF-8 연속 바이트가 전부
+   0x80 이상이라 boundary 목록에 없으므로 자동으로 "다른 닉네임의 일부"로
+   취급되어 오탐되지 않는다. */
+int is_mention_boundary(char c)
+{
+    return c == '\0' || c == ' ' || c == '\t' ||
+           c == '.' || c == ',' || c == '!' || c == '?' || c == '~' || c == ':';
+}
+
+int contains_mention(const char* text, const char* nickname)
+{
+    if (nickname[0] == '\0') return 0;
+
+    char pattern[MAX_NICK_LEN + 2];
+    snprintf(pattern, sizeof(pattern), "@%s", nickname);
+    size_t pat_len = strlen(pattern);
+
+    const char* p = text;
+    while ((p = strstr(p, pattern)) != NULL) {
+        if (is_mention_boundary(p[pat_len])) return 1;
+        p++;
+    }
+    return 0;
+}
+
+/* [SYS]/[ERR]/[WHISPER] 태그가 붙은 서버 메시지는 태그를 떼고 구분되게
+   보여준다. 태그 없는 일반 브로드캐스팅(닉네임: 내용)은 그대로 출력하되,
+   내 닉네임이 멘션됐으면 강조 + 비프음('\a') 처리. */
+void render_incoming(char* msg)
 {
     if (0 == strncmp(msg, "[SYS]", 5)) {
         printf("[SYSTEM] %s\n", msg + 5);
     } else if (0 == strncmp(msg, "[ERR]", 5)) {
         printf("[ERROR] %s\n", msg + 5);
+    } else if (0 == strncmp(msg, "[WHISPER_SENT]", 14)) {
+        char* sep = strchr(msg + 14, '|');
+        if (sep) {
+            *sep = '\0';
+            printf("[귓속말 -> %s] %s\n", msg + 14, sep + 1);
+        }
+    } else if (0 == strncmp(msg, "[WHISPER]", 9)) {
+        char* sep = strchr(msg + 9, '|');
+        if (sep) {
+            *sep = '\0';
+            printf("\a[귓속말 <- %s] %s\n", msg + 9, sep + 1);
+        }
+    } else if (contains_mention(msg, my_nickname)) {
+        printf("\a[멘션됨] %s\n", msg);
     } else {
         printf("%s\n", msg);
     }
@@ -92,6 +150,9 @@ int main(int argc, char* argv[])
         exit(1);
     }
 
+    strncpy(my_nickname, argv[3], MAX_NICK_LEN);
+    my_nickname[MAX_NICK_LEN] = '\0';
+
     /* 터미널이 아닌 곳(파이프/리다이렉트)으로 출력할 때 stdio가 fully-buffered로
        바뀌어 메시지가 즉시 안 보일 수 있다. 채팅 클라이언트 특성상 수신 즉시
        렌더링돼야 하므로 명시적으로 line-buffered로 고정한다. */
@@ -139,7 +200,21 @@ int main(int argc, char* argv[])
 
         char out[BUFSIZE];
         if (0 == strncmp(msg, "/name ", 6)) {
-            snprintf(out, sizeof(out), "[REQ:NAME]%s", msg + 6);
+            const char* new_name = msg + 6;
+            snprintf(out, sizeof(out), "[REQ:NAME]%s", new_name);
+            if (is_valid_nickname(new_name)) {
+                strncpy(my_nickname, new_name, MAX_NICK_LEN);
+                my_nickname[MAX_NICK_LEN] = '\0';
+            }
+        } else if (0 == strncmp(msg, "/w ", 3)) {
+            char* rest = msg + 3;
+            char* sp = strchr(rest, ' ');
+            if (sp == NULL) {
+                printf("사용법: /w 대상 메시지\n");
+                continue;
+            }
+            *sp = '\0';
+            snprintf(out, sizeof(out), "[REQ:WHISPER]%s|%s", rest, sp + 1);
         } else {
             snprintf(out, sizeof(out), "[CHAT]%s", msg);
         }
