@@ -2,6 +2,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <time.h>
 #include <arpa/inet.h>
 #include <sys/socket.h>
 #include <pthread.h>
@@ -9,6 +10,13 @@
 
 #define BUFSIZE 1024
 #define MAX_NICK_LEN 20
+
+#define COLOR_RESET   "\x1b[0m"
+#define COLOR_BOLD    "\x1b[1m"
+#define COLOR_RED     "\x1b[31m"
+#define COLOR_BLUE    "\x1b[34m"
+#define COLOR_YELLOW  "\x1b[33m"
+#define COLOR_MAGENTA "\x1b[35m"
 
 int sock;
 /* 멘션(@닉네임) 감지와 귓속말 표시(누구에게 보냈는지)에 필요해서 클라이언트도
@@ -61,31 +69,73 @@ int contains_mention(const char* text, const char* nickname)
     return 0;
 }
 
-/* [SYS]/[ERR]/[WHISPER] 태그가 붙은 서버 메시지는 태그를 떼고 구분되게
-   보여준다. 태그 없는 일반 브로드캐스팅(닉네임: 내용)은 그대로 출력하되,
-   내 닉네임이 멘션됐으면 강조 + 비프음('\a') 처리. */
+void print_timestamp(void)
+{
+    time_t now = time(NULL);
+    struct tm* t = localtime(&now);
+    printf("[%02d:%02d:%02d] ", t->tm_hour, t->tm_min, t->tm_sec);
+}
+
+/* "**볼드**" 구간만 ANSI bold로 감싸서 출력한다. 굵게 표시는 순전히 터미널
+   렌더링이라 전송되는 원문(** 포함)은 그대로 두고 화면에 찍을 때만 해석한다
+   (이모티콘 매크로처럼 전송 전에 실제 텍스트를 바꾸지 않음). */
+void print_markdown_bold(const char* text)
+{
+    const char* p = text;
+    while (*p) {
+        const char* start = strstr(p, "**");
+        if (!start) {
+            fputs(p, stdout);
+            return;
+        }
+        fwrite(p, 1, start - p, stdout);
+
+        const char* end = strstr(start + 2, "**");
+        if (!end) {
+            fputs(start, stdout);
+            return;
+        }
+        fputs(COLOR_BOLD, stdout);
+        fwrite(start + 2, 1, end - (start + 2), stdout);
+        fputs(COLOR_RESET, stdout);
+        p = end + 2;
+    }
+}
+
+/* [SYS]/[ERR]/[WHISPER] 태그가 붙은 서버 메시지는 태그를 떼고 색상으로
+   구분해 보여준다. 태그 없는 일반 브로드캐스팅(닉네임: 내용)은 마크다운
+   볼드만 해석해 출력하되, 내 닉네임이 멘션됐으면 강조 + 비프음('\a') 처리. */
 void render_incoming(char* msg)
 {
+    print_timestamp();
+
     if (0 == strncmp(msg, "[SYS]", 5)) {
-        printf("[SYSTEM] %s\n", msg + 5);
+        printf(COLOR_BLUE "[SYSTEM] %s" COLOR_RESET "\n", msg + 5);
     } else if (0 == strncmp(msg, "[ERR]", 5)) {
-        printf("[ERROR] %s\n", msg + 5);
+        printf(COLOR_RED "[ERROR] %s" COLOR_RESET "\n", msg + 5);
     } else if (0 == strncmp(msg, "[WHISPER_SENT]", 14)) {
         char* sep = strchr(msg + 14, '|');
         if (sep) {
             *sep = '\0';
-            printf("[귓속말 -> %s] %s\n", msg + 14, sep + 1);
+            printf(COLOR_MAGENTA "[귓속말 -> %s] ", msg + 14);
+            print_markdown_bold(sep + 1);
+            printf(COLOR_RESET "\n");
         }
     } else if (0 == strncmp(msg, "[WHISPER]", 9)) {
         char* sep = strchr(msg + 9, '|');
         if (sep) {
             *sep = '\0';
-            printf("\a[귓속말 <- %s] %s\n", msg + 9, sep + 1);
+            printf("\a" COLOR_MAGENTA "[귓속말 <- %s] ", msg + 9);
+            print_markdown_bold(sep + 1);
+            printf(COLOR_RESET "\n");
         }
     } else if (contains_mention(msg, my_nickname)) {
-        printf("\a[멘션됨] %s\n", msg);
+        printf("\a" COLOR_YELLOW "[멘션됨] ");
+        print_markdown_bold(msg);
+        printf(COLOR_RESET "\n");
     } else {
-        printf("%s\n", msg);
+        print_markdown_bold(msg);
+        printf("\n");
     }
 }
 
@@ -139,6 +189,51 @@ void send_line(const char* msg)
     write(sock, "\n", 1);
 }
 
+typedef struct { const char* macro; const char* emoji; } EmojiMacro;
+const EmojiMacro EMOJI_MACROS[] = {
+    {"(하트)", "❤️"},
+    {"(따봉)", "👍"},
+    {"(웃음)", "😊"},
+    {"(눈물)", "😢"},
+};
+#define EMOJI_MACRO_COUNT (sizeof(EMOJI_MACROS) / sizeof(EMOJI_MACROS[0]))
+
+/* 이모티콘은 볼드와 달리 "내용 자체"이므로 보내기 전에 실제로 치환해서
+   전송한다 - 그래야 상대방 화면에도 이모지 그대로 보인다. */
+void apply_emoji_macros(char* out, size_t out_cap, const char* text)
+{
+    size_t oi = 0;
+    for (size_t i = 0; text[i] != '\0' && oi + 1 < out_cap; ) {
+        size_t m;
+        for (m = 0; m < EMOJI_MACRO_COUNT; m++) {
+            size_t mlen = strlen(EMOJI_MACROS[m].macro);
+            if (0 == strncmp(text + i, EMOJI_MACROS[m].macro, mlen)) {
+                size_t elen = strlen(EMOJI_MACROS[m].emoji);
+                if (oi + elen >= out_cap) break;
+                memcpy(out + oi, EMOJI_MACROS[m].emoji, elen);
+                oi += elen;
+                i += mlen;
+                break;
+            }
+        }
+        if (m == EMOJI_MACRO_COUNT) {
+            out[oi++] = text[i++];
+        }
+    }
+    out[oi] = '\0';
+}
+
+void print_motd(void)
+{
+    printf(COLOR_BLUE
+        "==================================================\n"
+        " CN_CHAT 에 오신 것을 환영합니다!\n"
+        " /name /w /quit(q) /clear 명령어를 사용할 수 있어요.\n"
+        " (하트), (따봉) 처럼 입력하면 이모티콘으로 바뀌어요.\n"
+        "==================================================\n"
+        COLOR_RESET);
+}
+
 int main(int argc, char* argv[])
 {
     struct sockaddr_in serv_addr;
@@ -177,6 +272,7 @@ int main(int argc, char* argv[])
     }
 
     printf("서버에 연결되었습니다. (%s님으로 접속 시도)\n", argv[3]);
+    print_motd();
 
     pthread_create(&recv_thread, NULL, recv_msg, NULL);
     pthread_detach(recv_thread);
@@ -198,6 +294,14 @@ int main(int argc, char* argv[])
 
         if (strlen(msg) == 0) continue;
 
+        if (!strcmp(msg, "/clear")) {
+            /* 커서를 좌상단으로 이동 + 화면 전체 지우기 (ANSI escape) */
+            printf("\x1b[H\x1b[2J");
+            fflush(stdout);
+            continue;
+        }
+
+        char emoji_applied[BUFSIZE];
         char out[BUFSIZE];
         if (0 == strncmp(msg, "/name ", 6)) {
             const char* new_name = msg + 6;
@@ -214,9 +318,11 @@ int main(int argc, char* argv[])
                 continue;
             }
             *sp = '\0';
-            snprintf(out, sizeof(out), "[REQ:WHISPER]%s|%s", rest, sp + 1);
+            apply_emoji_macros(emoji_applied, sizeof(emoji_applied), sp + 1);
+            snprintf(out, sizeof(out), "[REQ:WHISPER]%s|%s", rest, emoji_applied);
         } else {
-            snprintf(out, sizeof(out), "[CHAT]%s", msg);
+            apply_emoji_macros(emoji_applied, sizeof(emoji_applied), msg);
+            snprintf(out, sizeof(out), "[CHAT]%s", emoji_applied);
         }
         send_line(out);
     }
