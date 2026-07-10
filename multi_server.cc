@@ -58,6 +58,10 @@ typedef struct {
     int votes_b;
     char voters[MAX_CLIENT][MAX_NICK_LEN + 1];
     int voter_count;
+    /* poll_end를 아무나 못 누르게, 시작한 사람만 기록해둔다.
+       30초 자동 타임아웃(poll_timeout_thread)은 시스템이 마감하는 것이라
+       이 권한 체크를 거치지 않는다. */
+    char starter[MAX_NICK_LEN + 1];
 } Poll;
 
 Poll poll;
@@ -316,6 +320,7 @@ void handle_whisper(int clnt_sock, char* payload)
     char to_target[BUFSIZE];
     char to_sender[BUFSIZE];
     int found = 0;
+    int self_whisper = 0;
 
     /* 대상의 fd를 락 밖으로 들고 나가 write()하면, 그 사이 대상이 접속을
        끊고 fd가 다른 신규 클라이언트에게 재사용될 경우 엉뚱한 사람에게
@@ -323,7 +328,9 @@ void handle_whisper(int clnt_sock, char* payload)
     pthread_mutex_lock(&clients_lock);
     int self_idx = find_index_by_fd(clnt_sock);
     int target_idx = find_index_by_nickname(target);
-    if (self_idx != -1 && target_idx != -1) {
+    if (self_idx != -1 && target_idx == self_idx) {
+        self_whisper = 1;
+    } else if (self_idx != -1 && target_idx != -1) {
         found = 1;
         snprintf(to_target, sizeof(to_target), "[WHISPER]%s|%s", clients[self_idx].nickname, text);
         snprintf(to_sender, sizeof(to_sender), "[WHISPER_SENT]%s|%s", clients[target_idx].nickname, text);
@@ -333,7 +340,9 @@ void handle_whisper(int clnt_sock, char* payload)
     }
     pthread_mutex_unlock(&clients_lock);
 
-    if (found) {
+    if (self_whisper) {
+        send_to(clnt_sock, "[ERR]자기 자신에게는 귓속말을 보낼 수 없습니다.");
+    } else if (found) {
         send_to(clnt_sock, to_sender);
     } else {
         char err[BUFSIZE];
@@ -419,6 +428,12 @@ void handle_bot_poll_start(int clnt_sock, char* payload)
     }
     *sep = '\0';
 
+    char starter[MAX_NICK_LEN + 1] = {0,};
+    pthread_mutex_lock(&clients_lock);
+    int caller_idx = find_index_by_fd(clnt_sock);
+    if (caller_idx != -1) strcpy(starter, clients[caller_idx].nickname);
+    pthread_mutex_unlock(&clients_lock);
+
     int started = 0;
     char sys_msg[BUFSIZE];
 
@@ -435,6 +450,8 @@ void handle_bot_poll_start(int clnt_sock, char* payload)
     poll.votes_a = 0;
     poll.votes_b = 0;
     poll.voter_count = 0;
+    strncpy(poll.starter, starter, MAX_NICK_LEN);
+    poll.starter[MAX_NICK_LEN] = '\0';
     poll.active = 1;
     started = 1;
     snprintf(sys_msg, sizeof(sys_msg),
@@ -490,6 +507,33 @@ void handle_bot_vote(int clnt_sock, const char* option)
     send_to(clnt_sock, "[SYS]투표가 반영되었습니다. (이후 변경 불가)");
 }
 
+/* poll_end는 투표를 시작한 사람만 가능하게 한다. 30초 자동 마감은
+   poll_timeout_thread가 이 함수를 거치지 않고 end_poll_if_active를 직접
+   불러서 처리하므로 이 권한 체크의 영향을 받지 않는다. */
+void handle_bot_poll_end(int clnt_sock)
+{
+    char caller[MAX_NICK_LEN + 1] = {0,};
+    pthread_mutex_lock(&clients_lock);
+    int idx = find_index_by_fd(clnt_sock);
+    if (idx != -1) strcpy(caller, clients[idx].nickname);
+    pthread_mutex_unlock(&clients_lock);
+
+    pthread_mutex_lock(&poll_lock);
+    if (!poll.active) {
+        pthread_mutex_unlock(&poll_lock);
+        send_to(clnt_sock, "[ERR]진행 중인 투표가 없습니다.");
+        return;
+    }
+    int authorized = (0 == strcmp(poll.starter, caller));
+    pthread_mutex_unlock(&poll_lock);
+
+    if (!authorized) {
+        send_to(clnt_sock, "[ERR]투표를 시작한 사람만 종료할 수 있습니다.");
+        return;
+    }
+    end_poll_if_active("수동 종료");
+}
+
 void handle_bot(int clnt_sock, char* payload)
 {
     if (0 == strcmp(payload, "dice")) {
@@ -497,7 +541,7 @@ void handle_bot(int clnt_sock, char* payload)
     } else if (0 == strcmp(payload, "random_user")) {
         handle_bot_random_user(clnt_sock);
     } else if (0 == strcmp(payload, "poll_end")) {
-        end_poll_if_active("수동 종료");
+        handle_bot_poll_end(clnt_sock);
     } else if (0 == strncmp(payload, "poll ", 5)) {
         handle_bot_poll_start(clnt_sock, payload + 5);
     } else if (0 == strncmp(payload, "vote ", 5)) {
