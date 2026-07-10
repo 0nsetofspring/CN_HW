@@ -376,6 +376,70 @@ const char* find_alias(const char* shortcut)
     return NULL;
 }
 
+/* '/'로 시작하는데 아는 명령어 어디에도 안 걸린 입력을 오타로 보고 가장
+   가까운 명령어를 제안한다. 라이브러리 없이 순수 문자열 편집 거리
+   (Levenshtein distance)만으로 계산 - 엔터를 이미 친 뒤에 하는 교정이라
+   타이핑 중 실시간 자동완성(그건 raw-mode 라인 에디터가 필요해서 안 됨)과는
+   다른 종류의 기능이다. */
+int edit_distance(const char* a, const char* b)
+{
+    int la = (int)strlen(a);
+    int lb = (int)strlen(b);
+    if (la >= 40 || lb >= 40) return 999;
+
+    int dp[41][41];
+    for (int i = 0; i <= la; i++) dp[i][0] = i;
+    for (int j = 0; j <= lb; j++) dp[0][j] = j;
+
+    for (int i = 1; i <= la; i++) {
+        for (int j = 1; j <= lb; j++) {
+            int cost = (a[i - 1] == b[j - 1]) ? 0 : 1;
+            int del = dp[i - 1][j] + 1;
+            int ins = dp[i][j - 1] + 1;
+            int sub = dp[i - 1][j - 1] + cost;
+            int m = (del < ins) ? del : ins;
+            dp[i][j] = (m < sub) ? m : sub;
+        }
+    }
+    return dp[la][lb];
+}
+
+const char* KNOWN_COMMANDS[] = {
+    "/help", "/clear", "/name", "/w", "/wr", "/wl",
+    "/list", "/search", "/alias", "/aliases", "/bot", "/quit"
+};
+#define KNOWN_COMMAND_COUNT (sizeof(KNOWN_COMMANDS) / sizeof(KNOWN_COMMANDS[0]))
+
+/* cmd_token은 입력의 첫 토큰(공백 전까지)만 넘어온다. 채팅으로 잘못 나가는
+   것보다 로컬에서 안내하고 전송을 막는 쪽이 안전하므로 호출 측에서 send를
+   생략한다. */
+void suggest_command(const char* cmd_token)
+{
+    int best_dist = 999;
+    const char* best = NULL;
+    int exact = 0;
+
+    for (size_t i = 0; i < KNOWN_COMMAND_COUNT; i++) {
+        if (0 == strcmp(cmd_token, KNOWN_COMMANDS[i])) {
+            exact = 1;
+            break;
+        }
+        int d = edit_distance(cmd_token, KNOWN_COMMANDS[i]);
+        if (d < best_dist) {
+            best_dist = d;
+            best = KNOWN_COMMANDS[i];
+        }
+    }
+
+    if (exact) {
+        printf("명령어 형식이 올바르지 않습니다. /help로 사용법을 확인하세요.\n");
+    } else if (best != NULL && best_dist <= 2) {
+        printf("알 수 없는 명령어입니다. 혹시 %s 를 찾으셨나요?\n", best);
+    } else {
+        printf("알 수 없는 명령어입니다. /help로 전체 명령어를 확인하세요.\n");
+    }
+}
+
 int main(int argc, char* argv[])
 {
     struct sockaddr_in serv_addr;
@@ -563,6 +627,18 @@ int main(int argc, char* argv[])
                 printf("알 수 없는 봇 명령입니다. /bot 을 입력해 도움말을 확인하세요.\n");
                 continue;
             }
+        } else if (msg[0] == '/') {
+            /* 위 명령어 분기 어디에도 안 걸렸는데 '/'로 시작하면 오타로 보고
+               채팅으로 보내는 대신 로컬에서 안내한다(잘못된 텍스트가 다른
+               사람 화면에 그대로 뜨는 것 방지). */
+            char cmd_token[BUFSIZE];
+            char* sp = strchr(msg, ' ');
+            size_t len = sp ? (size_t)(sp - msg) : strlen(msg);
+            if (len >= sizeof(cmd_token)) len = sizeof(cmd_token) - 1;
+            memcpy(cmd_token, msg, len);
+            cmd_token[len] = '\0';
+            suggest_command(cmd_token);
+            continue;
         } else {
             /* 입력한 줄 전체가 등록된 단축어와 정확히 일치하면 원문으로 풀어서 보낸다. */
             const char* expanded = find_alias(msg);
