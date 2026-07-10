@@ -256,6 +256,7 @@ void render_incoming(char* msg)
    (서버 쪽 send_to/broadcast가 각 메시지 끝에 '\n'을 붙여 보낸다). */
 void* recv_msg(void* arg)
 {
+    (void)arg;
     char chunk[BUFSIZE];
     char linebuf[BUFSIZE * 4];
     int linelen = 0;

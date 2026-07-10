@@ -109,13 +109,17 @@ int find_index_by_nickname(const char* nickname)
 }
 
 #define RATE_LIMIT_WINDOW_SEC 2
-#define RATE_LIMIT_MAX 5
+#define RATE_LIMIT_MAX 15
 
 /* 도배 방지: fd 하나가 RATE_LIMIT_WINDOW_SEC초 동안 RATE_LIMIT_MAX개 넘게
    보내면 그 이후 메시지는 거부한다. 엔터 연타/매크로로 다른 사람 화면과
    /search 기록을 순식간에 뒤덮는 것을 막기 위함 - 뮤텍스 경합만으로 서버가
    죽지는 않지만, 서비스 품질(가독성/기록 보존)은 확실히 망가지므로
-   애플리케이션 레벨에서 막는다. */
+   애플리케이션 레벨에서 막는다.
+   기준을 2초에 5개로 뒀다가 실제 테스트에서 사람이 명령어 여러 개를 빠르게
+   이어 치는 정상적인 흐름(채팅→닉변경→귓속말→봇 명령 등)조차 걸려버리는
+   걸 확인해서 15개로 완화했다. 그래도 매크로/엔터 연타(초당 수백~수천개)는
+   여전히 확실히 막힌다. */
 int rate_limit_check(int fd)
 {
     int allowed = 1;
