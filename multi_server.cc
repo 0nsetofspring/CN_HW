@@ -223,6 +223,9 @@ void handle_name_change(int clnt_sock, const char* new_name)
     broadcast(sys_msg, -1);
 }
 
+/* [CHAT] 처리: 클린 봇(censor_text)으로 금칙어를 걸러낸 뒤 history에 남기고
+   보낸 사람 본인을 제외한 전원에게 브로드캐스트한다. 귓속말과 달리 공개
+   채팅만 history에 남기는 이유는 history_add 위 주석 참고. */
 void handle_chat(int clnt_sock, const char* text)
 {
     char nickname[MAX_NICK_LEN + 1] = "익명";
@@ -351,6 +354,9 @@ void handle_whisper(int clnt_sock, char* payload)
     }
 }
 
+/* 1~100 사이 정수를 굴려 전원에게 방송(broadcast의 exclude_fd를 -1로 줘서
+   호출한 본인도 결과를 볼 수 있게 함 - 주사위 결과는 모두가 봐야 의미 있는
+   공개 액션이라 개인 응답이 아니라 브로드캐스트로 처리). */
 void handle_bot_dice(int clnt_sock)
 {
     char nickname[MAX_NICK_LEN + 1] = "누군가";
@@ -365,6 +371,8 @@ void handle_bot_dice(int clnt_sock)
     broadcast(sys_msg, -1);
 }
 
+/* 닉네임 등록이 끝난(nickname[0] != '\0') 접속자 중 한 명을 무작위 추첨해
+   전원에게 방송. dice와 마찬가지로 결과는 모두가 봐야 하는 공개 액션. */
 void handle_bot_random_user(int clnt_sock)
 {
     char picked[MAX_NICK_LEN + 1] = {0,};
@@ -467,6 +475,8 @@ void handle_bot_poll_start(int clnt_sock, char* payload)
     }
 }
 
+/* "1인 1표, 변경 불가" 정책: poll.voters에 이미 이름이 있으면 재투표를
+   거부한다(투표를 취소/변경하는 명령이 따로 없으므로 최초 1회만 유효). */
 void handle_bot_vote(int clnt_sock, const char* option)
 {
     char voter[MAX_NICK_LEN + 1] = {0,};
@@ -551,6 +561,9 @@ void handle_bot(int clnt_sock, char* payload)
     }
 }
 
+/* 클라이언트로부터 한 줄(개행 기준으로 이미 분리됨)을 받아 앞의 태그로
+   분기하는 프로토콜 진입점. README의 프로토콜 명세 표(C -> S 태그들)와
+   1:1로 대응된다. */
 void process_message(int clnt_sock, char* msg)
 {
     if (0 == strncmp(msg, "[REQ:NAME]", 10)) {

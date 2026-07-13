@@ -24,6 +24,8 @@ int sock;
    입력이 로컬 규칙(is_valid_nickname)을 통과하면 낙관적으로 갱신한다. */
 char my_nickname[MAX_NICK_LEN + 1];
 
+/* 소켓 계열 함수(socket/connect 등) 실패 시 즉시 종료. 연결 자체가 안 된
+   상태라 이후 로직을 이어갈 수 없으므로 에러 메시지만 찍고 프로세스를 끝낸다. */
 void error_handling(const char *message)
 {
     fputs(message, stderr);
@@ -135,6 +137,9 @@ void strip_escape_sequences(char* text)
     *dst = '\0';
 }
 
+/* render_incoming이 메시지 한 줄을 찍기 전에 호출해 "[HH:MM:SS] " 접두를
+   붙인다. 서버는 타임스탬프를 보내지 않으므로(프로토콜에 없음) 클라이언트가
+   수신 시각 기준으로 로컬에서 생성한다. */
 void print_timestamp(void)
 {
     time_t now = time(NULL);
@@ -332,6 +337,8 @@ void apply_emoji_macros(char* out, size_t out_cap, const char* text)
     out[oi] = '\0';
 }
 
+/* 접속 직후 1회 출력되는 웰컴 배너. 순수 로컬 UX 요소라 서버로 전송되지
+   않는다. */
 void print_motd(void)
 {
     printf(COLOR_BLUE
@@ -350,6 +357,9 @@ typedef struct { char shortcut[32]; char expansion[BUFSIZE]; } Alias;
 Alias aliases[MAX_ALIAS];
 int alias_count = 0;
 
+/* 같은 shortcut으로 다시 /alias 하면 기존 항목을 지우지 않고 expansion만
+   덮어써서 "재등록으로 수정"을 자연스럽게 허용한다(별도의 /alias 삭제
+   명령이 없으므로 덮어쓰기가 곧 수정 수단). */
 void add_alias(const char* shortcut, const char* expansion)
 {
     for (int i = 0; i < alias_count; i++) {
@@ -578,6 +588,10 @@ int main(int argc, char* argv[])
             continue;
         }
 
+        /* 여기서부터 사용자가 입력한 명령어를 서버 프로토콜 태그
+           ([REQ:LIST], [REQ:SEARCH], [REQ:NAME], [REQ:WHISPER], [REQ:BOT])로
+           변환해 out에 담는다. 태그가 없는 일반 텍스트는 맨 아래 else에서
+           [CHAT] 태그를 붙여 보낸다. */
         char emoji_applied[BUFSIZE];
         char out[BUFSIZE];
         if (!strcmp(msg, "/list")) {
